@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Vinyl Finder</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#111111" />
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">Vinyl Finder</div>
+    <nav class="nav">
+      <button id="tab-scan" class="tab active">Scan</button>
+      <button id="tab-profile" class="tab">Taste</button>
+      <button id="tab-library" class="tab">Library</button>
+    </nav>
+  </header>
+
+  <main class="main">
+    <section id="view-scan" class="view">
+      <h1>Scan a cover</h1>
+      <div class="card">
+        <video id="video" playsinline autoplay></video>
+        <canvas id="canvas" class="hidden"></canvas>
+        <div class="hint">Center the cover in frame, avoid glare.</div>
+
+        <div class="actions">
+          <button id="btn-start" class="primary">Enable Camera</button>
+          <button id="btn-capture" class="secondary" disabled>Capture</button>
+          <button id="btn-retake" class="secondary" disabled>Retake</button>
+          <button id="btn-identify" class="primary" disabled>Identify</button>
+        </div>
+        <div class="small">Backend: <span id="backend-url"></span></div>
+      </div>
+
+      <div id="scan-status" class="status"></div>
+
+      <div id="candidates" class="card hidden">
+        <h2>Matches</h2>
+        <div id="candidate-list" class="list"></div>
+        <div class="divider"></div>
+        <button id="btn-none" class="secondary">None of these (manual entry)</button>
+      </div>
+
+      <div id="manual" class="card hidden">
+        <h2>Manual entry</h2>
+        <label>Artist <input id="manual-artist" type="text" placeholder="e.g., Miles Davis"></label>
+        <label>Album <input id="manual-album" type="text" placeholder="e.g., Kind of Blue"></label>
+        <div class="actions">
+          <button id="btn-manual-confirm" class="primary">Use this</button>
+        </div>
+      </div>
+
+      <div id="result" class="card hidden">
+        <h2>Result</h2>
+        <div id="result-title" class="title"></div>
+        <div class="meta" id="result-meta"></div>
+        <div class="fit">
+          <div class="fit-row">
+            <div>Fit</div>
+            <div id="fit-score" class="fit-score">—</div>
+          </div>
+          <div id="fit-why" class="small"></div>
+        </div>
+        <div class="actions">
+          <button id="btn-save" class="primary">Save to Library</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-profile" class="view hidden">
+      <h1>Taste Profile</h1>
+      <div class="card">
+        <h2>Liked artists</h2>
+        <div class="small">Comma-separated.</div>
+        <textarea id="liked-artists" rows="3" placeholder="Radiohead, Nirvana, Miles Davis"></textarea>
+
+        <h2>Liked genres</h2>
+        <div class="small">Comma-separated.</div>
+        <textarea id="liked-genres" rows="3" placeholder="jazz, post-punk, classic rock"></textarea>
+
+        <h2>Preferred eras (decades)</h2>
+        <div class="small">Comma-separated. Example: 1950s, 1960s</div>
+        <input id="liked-eras" type="text" placeholder="1950s, 1960s, 1970s">
+
+        <div class="actions">
+          <button id="btn-save-profile" class="primary">Save Profile</button>
+        </div>
+        <div id="profile-status" class="status"></div>
+      </div>
+    </section>
+
+    <section id="view-library" class="view hidden">
+      <h1>Library</h1>
+      <div class="card">
+        <div class="actions">
+          <button id="btn-clear-library" class="secondary">Clear Library</button>
+        </div>
+        <div id="library-list" class="list"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js');
+    }
+  </script>
+</body>
+</html>
