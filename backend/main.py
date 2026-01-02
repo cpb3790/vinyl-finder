@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -9,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import requests
+
+from PIL import Image
+import imagehash
 
 # Google Vision client
 # Install: google-cloud-vision
@@ -230,6 +234,73 @@ def _dedupe_candidates(cands: List[Candidate]) -> List[Candidate]:
     return sorted(seen.values(), key=lambda x: x.confidence, reverse=True)
 
 
+
+
+
+def _clean_ocr_text(text: str) -> str:
+    """Turn OCR text into a compact Discogs search query."""
+    text = (text or "").replace("\n", " ")
+    text = re.sub(r"[^A-Za-z0-9\s\-\&'\"]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    tokens = [t for t in text.split(" ") if len(t) >= 3]
+    return " ".join(tokens[:14])
+
+
+def _call_text_detection(image_bytes: bytes) -> str:
+    """Run Cloud Vision OCR (text_detection) and return the full detected text."""
+    _require_vision()
+    client = vision.ImageAnnotatorClient()
+    image = vision.Image(content=image_bytes)
+    resp = client.text_detection(image=image)
+
+    if resp.error and resp.error.message:
+        raise HTTPException(status_code=502, detail=f"Vision OCR error: {resp.error.message}")
+
+    anns = resp.text_annotations
+    if not anns:
+        return ""
+    return (anns[0].description or "").strip()
+
+
+def _phash_from_bytes(image_bytes: bytes):
+    im = Image.open(BytesIO(image_bytes)).convert("RGB")
+    im = im.resize((512, 512))
+    return imagehash.phash(im)
+
+
+def _phash_from_url(url: str):
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"thumb fetch failed ({r.status_code})")
+    return _phash_from_bytes(r.content)
+
+
+def _confidence_from_distance(dist: int) -> float:
+    """Map pHash Hamming distance to confidence 0..1."""
+    # Conservative mapping: dist 0 -> 1.0, dist 10 -> 0.5, dist 20 -> 0.0
+    conf = 1.0 - (dist / 20.0)
+    return max(0.0, min(1.0, conf))
+
+
+def _rerank_discogs_results_by_phash(user_image_bytes: bytes, results: List[dict], top_k: int = 5) -> List[Tuple[float, int, dict]]:
+    """Return (confidence, distance, result) sorted best-first."""
+    user_h = _phash_from_bytes(user_image_bytes)
+    scored: List[Tuple[float, int, dict]] = []
+    for r in results:
+        thumb = r.get("thumb") or r.get("cover_image")
+        if not thumb:
+            continue
+        try:
+            cand_h = _phash_from_url(thumb)
+            dist = int(user_h - cand_h)
+            conf = _confidence_from_distance(dist)
+            scored.append((conf, dist, r))
+        except Exception:
+            continue
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[:top_k]
+
+
 def _call_web_detection(image_bytes: bytes) -> Dict[str, Any]:
     _require_vision()
     client = vision.ImageAnnotatorClient()
@@ -261,39 +332,105 @@ def _call_web_detection(image_bytes: bytes) -> Dict[str, Any]:
     return {"best_guess_labels": best_guesses, "web_entities": entities, "matching_pages": pages}
 
 
+@app.post("/api/ocr")
+async def ocr(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Debug endpoint: returns OCR text and the cleaned query used for Discogs search."""
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG/PNG/WebP.")
+
+    image_bytes = _read_image_bytes(file)
+    text = _call_text_detection(image_bytes)
+    return {
+        "ocr_text_raw": text[:5000],
+        "ocr_query": _clean_ocr_text(text),
+    }
+
+
 @app.post("/api/identify", response_model=IdentifyResponse)
 async def identify(file: UploadFile = File(...), debug: bool = False) -> IdentifyResponse:
     """Upload a vinyl cover photo and return top artist/album candidates.
 
-    This endpoint is designed to be conservative: it returns multiple candidates and
-    expects the user to confirm.
+    Strategy (best accuracy):
+      1) OCR (Vision text_detection) -> query string
+      2) Discogs database search -> candidate set
+      3) pHash re-rank using Discogs thumbnails
+
+    Fallback:
+      - Vision Web Detection (best_guess_labels / web_entities) -> candidate guesses
     """
     if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
         raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG/PNG/WebP.")
 
     image_bytes = _read_image_bytes(file)
-    vision_payload = _call_web_detection(image_bytes)
 
+    dbg: Dict[str, Any] = {}
     candidates: List[Candidate] = []
 
-    for bg in vision_payload.get("best_guess_labels", []):
-        c = _candidate_from_guess(bg["label"], bg["rank"])
-        if c:
-            candidates.append(c)
+    # 1) OCR -> Discogs candidates
+    ocr_text = _call_text_detection(image_bytes)
+    ocr_query = _clean_ocr_text(ocr_text)
 
-    for ent in vision_payload.get("web_entities", []):
-        desc = (ent.get("description") or "").strip()
-        if not desc:
-            continue
-        c = _candidate_from_entity(desc, ent.get("score") or 0.0)
-        if c:
-            candidates.append(c)
+    if debug:
+        dbg["ocr_query"] = ocr_query
+        dbg["ocr_text_preview"] = ocr_text[:500]
+
+    if ocr_query:
+        params = {
+            "q": ocr_query,
+            "type": "release",
+            "format": "Vinyl",
+            "per_page": 20,
+            "page": 1,
+        }
+        search = _discogs_get("/database/search", params=params)
+        results = search.get("results") or []
+
+        ranked = _rerank_discogs_results_by_phash(image_bytes, results, top_k=5)
+
+        for conf, dist, r in ranked:
+            title = (r.get("title") or "").strip()
+            artist, album = _split_artist_album(title)
+            if not artist or not album:
+                continue
+            candidates.append(
+                Candidate(
+                    artist=artist,
+                    album=album,
+                    confidence=conf,
+                    evidence={
+                        "source": "ocr+phash",
+                        "phash_distance": dist,
+                        "thumb": r.get("thumb") or r.get("cover_image"),
+                        "discogs_id": r.get("id"),
+                        "resource_url": r.get("resource_url"),
+                    },
+                )
+            )
+
+    # 2) Fallback to Vision Web Detection if needed
+    vision_payload: Dict[str, Any] = {}
+    if not candidates:
+        vision_payload = _call_web_detection(image_bytes)
+
+        for bg in vision_payload.get("best_guess_labels", []):
+            c = _candidate_from_guess(bg.get("label") or "", bg.get("language_code") or "", bg.get("score") or 0.0)
+            if c:
+                candidates.append(c)
+
+        for ent in vision_payload.get("web_entities", []):
+            desc = ent.get("description") or ""
+            if not desc:
+                continue
+            c = _candidate_from_entity(desc, ent.get("score") or 0.0)
+            if c:
+                candidates.append(c)
 
     candidates = _dedupe_candidates(candidates)[:5]
 
     resp = IdentifyResponse(candidates=candidates)
     if debug:
-        resp.debug = vision_payload
+        # Include OCR debug plus (if fallback used) the vision payload
+        resp.debug = {"ocr": dbg, "web_detection": vision_payload or None}
     return resp
 
 
